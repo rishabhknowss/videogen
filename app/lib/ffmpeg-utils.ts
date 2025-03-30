@@ -5,7 +5,6 @@ import path from 'path';
 import os from 'os';
 import { v4 as uuidv4 } from 'uuid';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { Readable } from 'stream';
 import { TimedScene } from '../api/video/generate/route';
 
@@ -158,216 +157,6 @@ export async function uploadToS3(filePath: string, userId: string, type: string)
   }
 }
 
-// Create a slideshow video with Ken Burns effect from images
-export async function createSlideshowVideo(
-  imagePaths: string[],
-  outputPath: string,
-  fps: number = 30,
-  transitionDuration: number = 1,
-  displayDuration: number = 3,
-  zoomFactor: number = 1.1
-): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    if (imagePaths.length === 0) {
-      reject(new Error('No images provided for slideshow'));
-      return;
-    }
-    
-    // Create a temporary filter complex script
-    const filterComplex = imagePaths.map((_, i) => {
-      // For each image, create a zooming/panning effect
-      const startZoom = 1;
-      const endZoom = zoomFactor;
-      const zoomDirection = i % 4; // Alternate between 4 different zoom directions
-      
-      // Determine zoom and pan parameters based on direction
-      let xStartStr: string = '0', yStartStr: string = '0';
-      
-      switch (zoomDirection) {
-        case 0: // Zoom in from center
-          xStartStr = `(iw-iw*${startZoom})/2`;
-          yStartStr = `(ih-ih*${startZoom})/2`;
-          break;
-        case 1: // Zoom in from top left
-          xStartStr = '0';
-          yStartStr = '0';
-          break;
-        case 2: // Zoom in from top right
-          xStartStr = `(iw-iw*${startZoom})`;
-          yStartStr = '0';
-          break;
-        case 3: // Zoom in from bottom
-          xStartStr = `(iw-iw*${startZoom})/2`;
-          yStartStr = `(ih-ih*${startZoom})`;
-          break;
-      }
-      
-      const duration = displayDuration;
-      
-      // Fix the zoompan parameter formatting
-      // Note: Using backticks for the outer string, but single quotes for the z expression
-      return `[${i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,zoompan=z='min(zoom+0.0015,${endZoom})':x=${xStartStr}:y=${yStartStr}:d=${duration*fps},trim=duration=${duration},fade=t=out:st=${duration-transitionDuration}:d=${transitionDuration}[v${i}];`;
-    }).join('');
-    
-    // Concatenate all the video segments
-    const concatStr = imagePaths.map((_, i) => `[v${i}]`).join('');
-    const lastFilter = `${concatStr}concat=n=${imagePaths.length}:v=1:a=0,format=yuv420p[v]`;
-    
-    // Build the full filter complex
-    const fullFilterComplex = `${filterComplex}${lastFilter}`;
-    
-    // Create a temporary file for the filter complex
-    const filterScriptPath = path.join(os.tmpdir(), `filter_${uuidv4()}.txt`);
-    fs.writeFileSync(filterScriptPath, fullFilterComplex);
-    
-    // Build ffmpeg command
-    const ffmpegArgs: string[] = [
-      '-y', // Overwrite output file if it exists
-    ];
-    
-    // Add input files
-    imagePaths.forEach(imagePath => {
-      ffmpegArgs.push('-loop', '1', '-t', displayDuration.toString(), '-i', imagePath);
-    });
-    
-    // Add filter complex and output settings
-    ffmpegArgs.push(
-      '-filter_complex_script', filterScriptPath,
-      '-map', '[v]',
-      '-c:v', 'libx264',
-      '-r', fps.toString(),
-      '-pix_fmt', 'yuv420p',
-      '-preset', 'medium',
-      '-crf', '23',
-      outputPath
-    );
-    
-    console.log('Executing FFMPEG with args:', ffmpegArgs.join(' '));
-    
-    // Spawn ffmpeg process
-    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
-    
-    let stdout = '';
-    let stderr = '';
-    
-    ffmpeg.stdout.on('data', (data) => {
-      stdout += data.toString();
-    });
-    
-    ffmpeg.stderr.on('data', (data) => {
-      stderr += data.toString();
-    });
-    
-    ffmpeg.on('error', (error) => {
-      console.error('FFMPEG process error:', error);
-      reject(error);
-    });
-    
-    ffmpeg.on('close', (code) => {
-      // Clean up the filter script
-      try {
-        fs.unlinkSync(filterScriptPath);
-      } catch (err) {
-        console.error('Error deleting filter script:', err);
-      }
-      
-      if (code === 0) {
-        console.log('FFMPEG process completed successfully');
-        resolve(outputPath);
-      } else {
-        console.error(`FFMPEG process exited with code ${code}`);
-        console.error('STDERR:', stderr);
-        reject(new Error(`FFMPEG exited with code ${code}: ${stderr}`));
-      }
-    });
-  });
-}
-
-// Define a type for pip position
-export type PipPosition = 'bottom_right' | 'bottom_left' | 'top_right' | 'top_left';
-
-// Merge main video with broll (picture-in-picture)
-export async function mergeVideos(
-  mainVideoPath: string,
-  brollVideoPath: string,
-  outputPath: string,
-  pipPosition: PipPosition = 'bottom_right',
-  pipSize: number = 0.3
-): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    // Calculate PIP position coordinates
-    let x: string, y: string;
-    switch (pipPosition) {
-      case 'bottom_right':
-        x = `main_w-overlay_w-10`;
-        y = `main_h-overlay_h-10`;
-        break;
-      case 'bottom_left':
-        x = '10';
-        y = `main_h-overlay_h-10`;
-        break;
-      case 'top_right':
-        x = `main_w-overlay_w-10`;
-        y = '10';
-        break;
-      case 'top_left':
-        x = '10';
-        y = '10';
-        break;
-    }
-    
-    // Build the filter complex for picture-in-picture
-    const filterComplex = `[0:v]setpts=PTS-STARTPTS[main];[1:v]setpts=PTS-STARTPTS,scale=iw*${pipSize}:ih*${pipSize}[pip];[main][pip]overlay=${x}:${y}:enable='between(t,0,999999)'[v]`;
-    
-    // Build ffmpeg command
-    const ffmpegArgs: string[] = [
-      '-y', // Overwrite output file if it exists
-      '-i', mainVideoPath, // Main video
-      '-i', brollVideoPath, // B-roll video
-      '-filter_complex', filterComplex,
-      '-map', '[v]', // Map the output video
-      '-map', '0:a', // Use audio from the main video
-      '-c:v', 'libx264',
-      '-c:a', 'aac',
-      '-preset', 'medium',
-      '-crf', '23',
-      outputPath
-    ];
-    
-    console.log('Executing FFMPEG for video merge with args:', ffmpegArgs.join(' '));
-    
-    // Spawn ffmpeg process
-    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
-    
-    let stdout = '';
-    let stderr = '';
-    
-    ffmpeg.stdout.on('data', (data) => {
-      stdout += data.toString();
-    });
-    
-    ffmpeg.stderr.on('data', (data) => {
-      stderr += data.toString();
-    });
-    
-    ffmpeg.on('error', (error) => {
-      console.error('FFMPEG process error:', error);
-      reject(error);
-    });
-    
-    ffmpeg.on('close', (code) => {
-      if (code === 0) {
-        console.log('FFMPEG video merge completed successfully');
-        resolve(outputPath);
-      } else {
-        console.error(`FFMPEG video merge exited with code ${code}`);
-        console.error('STDERR:', stderr);
-        reject(new Error(`FFMPEG exited with code ${code}: ${stderr}`));
-      }
-    });
-  });
-}
-
 // Clean up temporary files
 export function cleanupTempFiles(filePaths: string[]): void {
   for (const file of filePaths) {
@@ -382,244 +171,8 @@ export function cleanupTempFiles(filePaths: string[]): void {
   }
 }
 
-// Enhanced portrait video merge function for ffmpeg-utils.ts
-
-// Merge main video with broll (portrait format with broll as background)
-// Fixed portrait video merge function for ffmpeg-utils.ts
-
-// Merge main video with broll (portrait format with broll as background)
-// Split-screen portrait video merge function for ffmpeg-utils.ts
-
-// Merge main video with broll (portrait format with split screen)
-// Improved split-screen portrait video merge function for ffmpeg-utils.ts
-
-// Merge main video with broll (portrait format with split screen)
-export async function mergePortraitVideo(
-    personVideoPath: string,
-    brollVideoPath: string,
-    outputPath: string,
-    personSize: number = 1.0, // Default to fill the bottom half completely
-    personPosition: 'bottom' | 'bottom_left' | 'bottom_right' = 'bottom'
-  ): Promise<string> {
-    return new Promise((resolve, reject) => {
-      // Get video duration and dimensions first
-      const ffprobeArgs = [
-        '-v', 'error',
-        '-select_streams', 'v:0',
-        '-show_entries', 'stream=width,height,duration',
-        '-of', 'json',
-        personVideoPath
-      ];
-      
-      const ffprobe = spawn('ffprobe', ffprobeArgs);
-      let probeData = '';
-      
-      ffprobe.stdout.on('data', (data) => {
-        probeData += data.toString();
-      });
-      
-      ffprobe.on('close', (code) => {
-        if (code !== 0) {
-          return reject(new Error(`FFprobe exited with code ${code}`));
-        }
-        
-        try {
-          // Parse probe data
-          const probe = JSON.parse(probeData);
-          const personDuration = parseFloat(probe.streams[0].duration);
-          const personWidth = parseInt(probe.streams[0].width, 10);
-          const personHeight = parseInt(probe.streams[0].height, 10);
-          
-          // For portrait mode with split screen
-          const outputWidth = 1080;
-          const outputHeight = 1920;
-          
-          // Calculate dimensions for the split screen
-          // Top half for broll, bottom half for person
-          const halfHeight = outputHeight / 2;
-          
-          // Calculate person video size to fill bottom half horizontally
-          // and maintain aspect ratio
-          const personOutputWidth = outputWidth;
-          const personOutputHeight = Math.round(personOutputWidth * personHeight / personWidth);
-          
-          // Crop person video if it's too tall for the bottom half
-          let yOffset = 0;
-          let cropCommand = '';
-          
-          if (personOutputHeight > halfHeight) {
-            // Person video is taller than the bottom half, so crop it
-            // Calculate how much to crop from top and bottom equally
-            const cropAmount = personOutputHeight - halfHeight;
-            const topCrop = Math.round(cropAmount / 2);
-            
-            // Add crop filter
-            cropCommand = `,crop=${personOutputWidth}:${halfHeight}:0:${topCrop}`;
-          } else {
-            // Center vertically in bottom half if smaller
-            yOffset = Math.round((halfHeight - personOutputHeight) / 2);
-          }
-          
-          // Position person video in bottom half
-          let xPosition = 0; // Default to full width
-          
-          if (personSize < 1.0) {
-            // If person size is less than 1.0, scale it down and position accordingly
-            const scaledWidth = Math.round(outputWidth * personSize);
-            const scaledHeight = Math.round(scaledWidth * personHeight / personWidth);
-            
-            switch (personPosition) {
-              case 'bottom_left':
-                xPosition = 0;
-                break;
-              case 'bottom_right':
-                xPosition = outputWidth - scaledWidth;
-                break;
-              case 'bottom':
-              default:
-                // Center horizontally
-                xPosition = Math.round((outputWidth - scaledWidth) / 2);
-                break;
-            }
-          }
-          
-          // Create filter complex - using a simpler approach that's more compatible
-          const filterComplex = [
-            // Create black background for the whole frame
-            `color=black:s=${outputWidth}x${outputHeight}:r=30[base]`,
-            
-            // For the broll, we'll directly scale each image and create a sequence
-            // This avoids zoompan filter which can be problematic in some ffmpeg versions
-            `[1:v]scale=${outputWidth}:${halfHeight}:force_original_aspect_ratio=increase,` +
-            `crop=${outputWidth}:${halfHeight}:(in_w-out_w)/2:(in_h-out_h)/2,setpts=PTS-STARTPTS[broll]`,
-            
-            // Scale person video for bottom half (and crop if needed)
-            `[0:v]scale=${personOutputWidth}:${personOutputHeight}${cropCommand},setpts=PTS-STARTPTS[person]`,
-            
-            // Overlay broll on top half of base
-            `[base][broll]overlay=0:0[withbroll]`,
-            
-            // Overlay person video on bottom half
-            `[withbroll][person]overlay=${xPosition}:${halfHeight + yOffset}[v]`
-          ].join(';');
-          
-          // Build ffmpeg command
-          const ffmpegArgs = [
-            '-y', // Overwrite output file if it exists
-            
-            // Input files
-            '-i', personVideoPath, // Person video
-            '-i', brollVideoPath,  // Broll video
-            
-            // Complex filter
-            '-filter_complex', filterComplex,
-            
-            // Map video and audio streams
-            '-map', '[v]',      // Use the output of our filter complex
-            '-map', '0:a',      // Use audio from the person video
-            
-            // Set duration to match person video
-            '-t', personDuration.toString(),
-            
-            // Output settings
-            '-c:v', 'libx264',
-            '-c:a', 'aac',
-            '-preset', 'fast', // Use fast preset for quicker encoding
-            '-crf', '23',
-            outputPath
-          ];
-          
-          console.log('Executing FFMPEG for improved split-screen video merge with args:', ffmpegArgs.join(' '));
-          
-          // Spawn ffmpeg process
-          const ffmpeg = spawn('ffmpeg', ffmpegArgs);
-          
-          let stderr = '';
-          
-          ffmpeg.stderr.on('data', (data) => {
-            const line = data.toString();
-            stderr += line;
-            // Log progress
-            if (line.includes('time=') || line.includes('frame=')) {
-              process.stdout.write(`\rFFMPEG: ${line.trim()}`);
-            }
-          });
-          
-          ffmpeg.on('error', (error) => {
-            console.error('FFMPEG process error:', error);
-            reject(error);
-          });
-          
-          ffmpeg.on('close', (code) => {
-            if (code === 0) {
-              console.log('\nFFMPEG split-screen video merge completed successfully');
-              resolve(outputPath);
-            } else {
-              console.error(`\nFFMPEG split-screen video merge exited with code ${code}`);
-              console.error('STDERR:', stderr);
-              
-              // Try an even simpler approach as a last resort
-              const lastResortFilter = [
-                // Create black background
-                `color=black:s=${outputWidth}x${outputHeight}:r=30[base]`,
-                
-                // Scale broll for top half
-                `[1:v]scale=${outputWidth}:${halfHeight},setpts=PTS-STARTPTS[broll]`,
-                
-                // Scale person video
-                `[0:v]scale=${outputWidth}:${halfHeight},setpts=PTS-STARTPTS[person]`,
-                
-                // Place broll on top
-                `[base][broll]overlay=0:0[top]`,
-                
-                // Place person on bottom
-                `[top][person]overlay=0:${halfHeight}[v]`
-              ].join(';');
-              
-              const simpleArgs = [
-                '-y',
-                '-i', personVideoPath,
-                '-i', brollVideoPath,
-                '-filter_complex', lastResortFilter,
-                '-map', '[v]',
-                '-map', '0:a',
-                '-t', personDuration.toString(),
-                '-c:v', 'libx264',
-                '-c:a', 'aac',
-                '-preset', 'fast',
-                '-crf', '23',
-                outputPath
-              ];
-              
-              console.log('Trying last resort approach...');
-              const lastResort = spawn('ffmpeg', simpleArgs);
-              
-              let lastResortErr = '';
-              
-              lastResort.stderr.on('data', (data) => {
-                lastResortErr += data.toString();
-              });
-              
-              lastResort.on('close', (code2) => {
-                if (code2 === 0) {
-                  console.log('Last resort approach succeeded!');
-                  resolve(outputPath);
-                } else {
-                  reject(new Error(`FFMPEG failed with both approaches. Last error: ${lastResortErr}`));
-                }
-              });
-            }
-          });
-        } catch (error) {
-          reject(error);
-        }
-      });
-    });
-  }
-
-  // Create a slideshow with smooth transitions and Ken Burns effect
-// Create a simplified slideshow with Ken Burns effect
-async function createEnhancedSlideshow(
+// Create a slideshow with images and audio
+export async function createSlideshowVideo(
   imagePaths: string[],
   audioPath: string,
   outputPath: string,
@@ -644,17 +197,17 @@ async function createEnhancedSlideshow(
       // Add audio input
       ffmpegInputs.push('-i', audioPath);
       
-      // Create a simplified filter complex
+      // Create a simplified filter complex - USING PORTRAIT DIMENSIONS: 720x1280
       let filterComplex = '';
       
       // Process each image with scale and pad first
       imagePaths.forEach((_, i) => {
-        filterComplex += `[${i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,` +
-          `pad=1920:1080:(ow-iw)/2:(oh-ih)/2[v${i}];`;
+        filterComplex += `[${i}:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
+          `pad=720:1280:(ow-iw)/2:(oh-ih)/2[v${i}];`;
       });
       
       // Create segments with the correct durations
-      const segments : string[]= [];
+      const segments : string[] = [];
       timedScenes.forEach((scene, i) => {
         if (i < imagePaths.length) {
           // Calculate duration in seconds
@@ -687,7 +240,7 @@ async function createEnhancedSlideshow(
         outputPath                      // Output file
       ];
       
-      console.log('FFmpeg simplified slideshow command:', ffmpegArgs.join(' '));
+      console.log('FFmpeg portrait slideshow command:', ffmpegArgs.join(' '));
       
       // Execute the FFmpeg command
       const ffmpeg = spawn('ffmpeg', ffmpegArgs);
@@ -707,7 +260,7 @@ async function createEnhancedSlideshow(
       
       ffmpeg.on('close', (code) => {
         if (code === 0) {
-          console.log('\nFFmpeg slideshow created successfully');
+          console.log('\nFFmpeg portrait slideshow created successfully');
           resolve(outputPath);
         } else {
           console.error(`\nFFmpeg process exited with code ${code}`);
@@ -716,13 +269,15 @@ async function createEnhancedSlideshow(
         }
       });
     } catch (error) {
-      console.error('Error creating enhanced slideshow:', error);
+      console.error('Error creating portrait slideshow:', error);
       reject(error);
     }
   });
 }
 
-// Create a basic slideshow as a fallback option
+// Third, update the basic slideshow fallback function:
+
+// Create a basic slideshow as a fallback option (in portrait mode)
 async function createBasicSlideshow(
   imagePaths: string[],
   audioPath: string,
@@ -758,13 +313,15 @@ async function createBasicSlideshow(
       // Write the list file
       fs.writeFileSync(inputListPath, fileContent);
       
-      // Simple FFmpeg command using concat demuxer
+      // Simple FFmpeg command using concat demuxer with portrait dimensions
       const ffmpegArgs = [
         '-y',                        // Overwrite output file
         '-f', 'concat',              // Use concat demuxer
         '-safe', '0',                // Allow unsafe file paths
         '-i', inputListPath,         // Input file list
         '-i', audioPath,             // Audio input
+        '-filter_complex',           // Add filter for portrait mode scaling
+        'scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2',
         '-c:v', 'libx264',           // Video codec
         '-c:a', 'aac',               // Audio codec
         '-pix_fmt', 'yuv420p',       // Pixel format
@@ -772,7 +329,7 @@ async function createBasicSlideshow(
         outputPath                   // Output file
       ];
       
-      console.log('FFmpeg basic slideshow command:', ffmpegArgs.join(' '));
+      console.log('FFmpeg basic portrait slideshow command:', ffmpegArgs.join(' '));
       
       // Execute FFmpeg
       const ffmpeg = spawn('ffmpeg', ffmpegArgs);
@@ -798,7 +355,7 @@ async function createBasicSlideshow(
         }
         
         if (code === 0) {
-          console.log('\nFFmpeg basic slideshow created successfully');
+          console.log('\nFFmpeg basic portrait slideshow created successfully');
           resolve(outputPath);
         } else {
           console.error(`\nFFmpeg process exited with code ${code}`);
@@ -807,71 +364,205 @@ async function createBasicSlideshow(
         }
       });
     } catch (error) {
-      console.error('Error creating basic slideshow:', error);
+      console.error('Error creating basic portrait slideshow:', error);
       reject(error);
     }
   });
 }
 
-// Function to merge slideshow and person video into a split-screen format
-export async function createSplitScreenVideo(
-  slideshowPath: string,
+
+// Create a video that starts with person speaking, then transitions to slideshow
+// Updated createIntroToSlideshowVideo function for portrait mode
+export async function createIntroToSlideshowVideo(
   personVideoPath: string,
-  outputPath: string
+  slideshowPath: string,
+  outputPath: string,
+  introSeconds: number = 5
 ): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     try {
-      // Build FFmpeg command for split-screen merge
-      const ffmpegArgs = [
-        '-y',                                 // Overwrite output file if it exists
-        '-i', slideshowPath,                  // Slideshow input (with Ken Burns effect)
-        '-i', personVideoPath,                // Person video input (lip-synced)
-        '-filter_complex',                    // Start complex filtergraph
-        // Create a 16:9 split-screen video with images on top and person on bottom
-        `[0:v]scale=1920:1080,setsar=1[top];` +  // Scale slideshow to 1920x1080
-        `[1:v]scale=1920:1080,setsar=1[bottom];` + // Scale person video to 1920x1080
-        // Stack the videos vertically (top 50%, bottom 50%)
-        `[top][bottom]vstack=inputs=2[v]`,
-        '-map', '[v]',                       // Map combined video
-        '-map', '0:a',                       // Use audio from slideshow (which has the full audio)
-        '-c:v', 'libx264',                   // Video codec
-        '-c:a', 'aac',                       // Audio codec
-        '-preset', 'medium',                  // Encoding preset
-        '-crf', '23',                         // Quality level
-        '-shortest',                          // End when shortest input ends
-        outputPath                            // Output file
+      // Get dimension and duration info for both videos
+      const ffprobeArgs = [
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height,duration',
+        '-of', 'json',
+        personVideoPath
       ];
       
-      console.log('FFmpeg split-screen command:', ffmpegArgs.join(' '));
+      const ffprobe = spawn('ffprobe', ffprobeArgs);
+      let probeData = '';
       
-      // Execute the FFmpeg command
-      const ffmpeg = spawn('ffmpeg', ffmpegArgs);
-      
-      let stderr = '';
-      
-      ffmpeg.stderr.on('data', (data) => {
-        stderr += data.toString();
-        // Log progress
-        process.stdout.write(`\rFFmpeg Merge: ${data.toString().trim()}`);
+      ffprobe.stdout.on('data', (data) => {
+        probeData += data.toString();
       });
       
-      ffmpeg.on('error', (error) => {
-        console.error('\nFFmpeg merge error:', error);
-        reject(error);
-      });
-      
-      ffmpeg.on('close', (code) => {
-        if (code === 0) {
-          console.log('\nFFmpeg split-screen merge completed successfully');
-          resolve(outputPath);
-        } else {
-          console.error(`\nFFmpeg merge exited with code ${code}`);
-          console.error('FFmpeg merge stderr:', stderr);
-          reject(new Error(`FFmpeg merge exited with code ${code}`));
+      ffprobe.on('close', (code) => {
+        if (code !== 0) {
+          return reject(new Error(`FFprobe exited with code ${code}`));
+        }
+        
+        try {
+          // Parse probe data for person video
+          const probe = JSON.parse(probeData);
+          const personDuration = parseFloat(probe.streams[0].duration);
+          const personWidth = parseInt(probe.streams[0].width, 10);
+          const personHeight = parseInt(probe.streams[0].height, 10);
+          
+          console.log(`Person video dimensions: ${personWidth}x${personHeight}, duration: ${personDuration}s`);
+          
+          // Get slideshow dimensions
+          const slideshowProbeArgs = [
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height',
+            '-of', 'json',
+            slideshowPath
+          ];
+          
+          const slideshowProbe = spawn('ffprobe', slideshowProbeArgs);
+          let slideshowProbeData = '';
+          
+          slideshowProbe.stdout.on('data', (data) => {
+            slideshowProbeData += data.toString();
+          });
+          
+          slideshowProbe.on('close', (slideshowProbeCode) => {
+            if (slideshowProbeCode !== 0) {
+              return reject(new Error(`FFprobe for slideshow exited with code ${slideshowProbeCode}`));
+            }
+            
+            try {
+              // Parse slideshow dimensions
+              const slideshowInfo = JSON.parse(slideshowProbeData);
+              const slideshowWidth = parseInt(slideshowInfo.streams[0].width, 10);
+              const slideshowHeight = parseInt(slideshowInfo.streams[0].height, 10);
+              
+              console.log(`Slideshow dimensions: ${slideshowWidth}x${slideshowHeight}`);
+              
+              // Ensure intro duration is not longer than person video
+              const actualIntroSeconds = Math.min(introSeconds, personDuration);
+              console.log(`Creating portrait intro-to-slideshow with ${actualIntroSeconds}s intro`);
+              
+              // Ensure both videos are portrait and same width/height
+              const targetWidth = 720;  // Standard width for portrait video
+              const targetHeight = 1280; // Standard height for portrait (9:16 aspect ratio)
+              
+              // First create scaled versions of both videos to ensure they have identical dimensions
+              const tempDir = path.dirname(outputPath);
+              
+              // Create scaled intro clip (first N seconds of person video)
+              const scaledIntroPath = path.join(tempDir, `scaled_intro_${uuidv4()}.mp4`);
+              const introCmdArgs = [
+                '-y',
+                '-i', personVideoPath,
+                '-ss', '0',
+                '-t', `${actualIntroSeconds}`,
+                '-vf', `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2`,
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                scaledIntroPath
+              ];
+              
+              console.log('Creating scaled portrait intro segment...');
+              const introProcess = spawn('ffmpeg', introCmdArgs);
+              
+              let introStderr = '';
+              introProcess.stderr.on('data', (data) => {
+                introStderr += data.toString();
+              });
+              
+              introProcess.on('close', (introCode) => {
+                if (introCode !== 0) {
+                  console.error('Error creating intro segment:', introStderr);
+                  reject(new Error('Failed to create scaled intro segment'));
+                  return;
+                }
+                
+                // Create scaled remaining portion of slideshow
+                const scaledRemainingPath = path.join(tempDir, `scaled_remaining_${uuidv4()}.mp4`);
+                const remainingCmdArgs = [
+                  '-y',
+                  '-i', slideshowPath,
+                  '-ss', `${actualIntroSeconds}`,
+                  '-vf', `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2`,
+                  '-c:v', 'libx264',
+                  '-c:a', 'aac',
+                  scaledRemainingPath
+                ];
+                
+                console.log('Creating scaled portrait slideshow segment...');
+                const remainingProcess = spawn('ffmpeg', remainingCmdArgs);
+                
+                let remainingStderr = '';
+                remainingProcess.stderr.on('data', (data) => {
+                  remainingStderr += data.toString();
+                });
+                
+                remainingProcess.on('close', (remainingCode) => {
+                  if (remainingCode !== 0) {
+                    // Clean up
+                    try { fs.unlinkSync(scaledIntroPath); } catch (e) {}
+                    console.error('Error creating remaining segment:', remainingStderr);
+                    reject(new Error('Failed to create scaled slideshow segment'));
+                    return;
+                  }
+                  
+                  // Now the simplest method that works reliably is to create a concat list
+                  const concatListPath = path.join(tempDir, `concat_list_${uuidv4()}.txt`);
+                  fs.writeFileSync(concatListPath, 
+                    `file '${scaledIntroPath}'\n` +
+                    `file '${scaledRemainingPath}'`
+                  );
+                  
+                  // Simple concat approach - most reliable for consistent dimensions
+                  const concatArgs = [
+                    '-y',
+                    '-f', 'concat',
+                    '-safe', '0',
+                    '-i', concatListPath,
+                    '-c', 'copy',  // Just copy the streams, no re-encoding
+                    outputPath
+                  ];
+                  
+                  console.log('Creating final portrait video by concat...');
+                  const concatProcess = spawn('ffmpeg', concatArgs);
+                  
+                  let concatStderr = '';
+                  concatProcess.stderr.on('data', (data) => {
+                    concatStderr += data.toString();
+                  });
+                  
+                  concatProcess.on('close', (concatCode) => {
+                    // Clean up temporary files
+                    try {
+                      fs.unlinkSync(scaledIntroPath);
+                      fs.unlinkSync(scaledRemainingPath);
+                      fs.unlinkSync(concatListPath);
+                    } catch (e) {
+                      console.error('Error deleting temp files:', e);
+                    }
+                    
+                    if (concatCode === 0) {
+                      console.log('Successfully created portrait intro-to-slideshow video');
+                      resolve(outputPath);
+                    } else {
+                      console.error('Error concatenating videos:', concatStderr);
+                      reject(new Error('Failed to concatenate videos'));
+                    }
+                  });
+                });
+              });
+            } catch (error) {
+              reject(error);
+            }
+          });
+        } catch (error) {
+          reject(error);
         }
       });
     } catch (error) {
-      console.error('Error creating split-screen video:', error);
+      console.error('Error in createIntroToSlideshowVideo:', error);
       reject(error);
     }
   });

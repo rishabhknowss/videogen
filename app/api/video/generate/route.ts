@@ -1,4 +1,4 @@
-// app/api/video/generate/route.ts - Fixed version
+// app/api/video/generate/route.ts - Full Updated Version
 
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
@@ -11,7 +11,8 @@ import fs from 'fs';
 import { 
   downloadFromURL, 
   uploadToS3,
-  cleanupTempFiles
+  cleanupTempFiles,
+  createIntroToSlideshowVideo
 } from '@/app/lib/ffmpeg-utils';
 import { getTranscriptWithTimestamps, groupWordsIntoScenes } from '@/app/lib/assemblyai';
 import { spawn } from 'child_process';
@@ -220,29 +221,53 @@ export async function POST(req: NextRequest) {
       );
     }
     
-    // Create split-screen video if slideshow was created successfully
-    let splitScreenUrl = null;
+    // Create intro-to-slideshow video instead of split-screen
+    let finalVideoUrl = null;
     if (slideshowSuccess) {
       try {
-        console.log("Creating split-screen video...");
-        const splitScreenPath = path.join(tempDir, `splitscreen_${projectId}_${Date.now()}.mp4`);
-        tempFiles.push(splitScreenPath);
+        console.log("Creating intro-to-slideshow video...");
+        const introSlideshowPath = path.join(tempDir, `intro_slideshow_${projectId}_${Date.now()}.mp4`);
+        tempFiles.push(introSlideshowPath);
         
-        await createSplitScreenVideo(
-          slideshowPath,
+        // Create a video that starts with person speaking for 5 seconds, then transitions to slideshow
+        await createIntroToSlideshowVideo(
           lipsyncPath,
-          splitScreenPath
+          slideshowPath,
+          introSlideshowPath,
+          5 // Show person for 5 seconds then transition to slideshow
         );
         
-        console.log("Uploading split-screen video to S3...");
-        splitScreenUrl = await uploadToS3(
-          splitScreenPath,
+        console.log("Uploading intro-to-slideshow video to S3...");
+        finalVideoUrl = await uploadToS3(
+          introSlideshowPath,
           session.user.id,
           'final-videos'
         );
-      } catch (splitScreenError) {
-        console.error("Split-screen video creation failed:", splitScreenError);
-        // Continue with the flow, we'll at least have the lipsync video
+        console.log("Successfully created and uploaded intro-to-slideshow video!");
+      } catch (introSlideshowError) {
+        console.error("Intro-to-slideshow video creation failed:", introSlideshowError);
+        // Fall back to split-screen if intro-to-slideshow fails
+        try {
+          console.log("Falling back to split-screen video...");
+          const splitScreenPath = path.join(tempDir, `splitscreen_${projectId}_${Date.now()}.mp4`);
+          tempFiles.push(splitScreenPath);
+          
+          await createSplitScreenVideo(
+            slideshowPath,
+            lipsyncPath,
+            splitScreenPath
+          );
+          
+          console.log("Uploading split-screen video to S3...");
+          finalVideoUrl = await uploadToS3(
+            splitScreenPath,
+            session.user.id,
+            'final-videos'
+          );
+        } catch (splitScreenError) {
+          console.error("Split-screen video creation failed:", splitScreenError);
+          // Continue with the flow, we'll at least have the lipsync video
+        }
       }
     }
     
@@ -261,8 +286,8 @@ export async function POST(req: NextRequest) {
       updateData.slideshowUrl = slideshowUrl;
     }
     
-    if (splitScreenUrl) {
-      updateData.finalVideoUrl = splitScreenUrl;
+    if (finalVideoUrl) {
+      updateData.finalVideoUrl = finalVideoUrl;
     }
     
     await prisma.project.update({
@@ -278,7 +303,7 @@ export async function POST(req: NextRequest) {
       message: "Videos generated successfully",
       lipsyncUrl: lipsyncUrl,
       slideshowUrl: slideshowUrl,
-      splitScreenUrl: splitScreenUrl,
+      finalVideoUrl: finalVideoUrl,
       wordCount: transcript.words.length,
       duration: transcript.audio_duration
     });
