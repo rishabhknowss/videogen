@@ -1,0 +1,108 @@
+// prisma/schema.prisma
+// This is your Prisma schema file - updated to include slideshowUrl field
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// NextAuth Models
+model Account {
+  id                 String  @id @default(cuid())
+  userId             String
+  type               String
+  provider           String
+  providerAccountId  String
+  refresh_token      String?  @db.Text
+  access_token       String?  @db.Text
+  expires_at         Int?
+  token_type         String?
+  scope              String?
+  id_token           String?  @db.Text
+  session_state      String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// Application Models
+enum ProjectStatus {
+  DRAFT
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  emailVerified DateTime?
+  name          String?
+  image         String?
+  videoUrl      String? 
+  audioUrl      String?
+  voice_id      String?   
+  createdAt     DateTime  @default(now())
+  projects      Project[]
+  
+  // NextAuth relations
+  accounts      Account[]
+  sessions      Session[]
+}
+
+// prisma/schema.prisma - Updated project model
+
+model Project {
+  id              Int      @id @default(autoincrement())
+  title           String
+  userId          String 
+  script          String?  @db.Text
+  scenes          String?  @db.Text // JSON string containing scene data with multiple image prompts
+  outputUrl       String?  // URL of the lip-synced video
+  status          ProjectStatus @default(DRAFT)
+  
+  // Image related fields
+  imagePrompts    String[] // All image prompts for all scenes
+  sceneImageMap   String?  @db.Text // JSON mapping of scene index to image prompts/URLs
+  generatedImages String[] // URLs of all generated images from the prompts
+  
+  // B-roll images and videos for variety
+  brollImages     String[] // Additional images for variety
+  brollVideoUrl   String?  // URL of the B-roll video created from images
+  
+  // Audio/transcript related fields
+  transcript      String?  @db.Text // Full AssemblyAI transcript with word timestamps (JSON)
+  timedScenes     String?  @db.Text // JSON array of scenes with start/end times and image URLs
+  audioDuration   Float?   // Duration of the audio in seconds
+  
+  // Video outputs
+  slideshowUrl    String?  // URL of the enhanced slideshow with Ken Burns effect
+  finalVideoUrl   String?  // URL of the split-screen final video
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([userId])
+}
